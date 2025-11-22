@@ -1,0 +1,230 @@
+{
+  "info": {
+    "name": "SQL Query Buddy - Complete API Collection",
+    "description": "Test all endpoints of the SQL Query Buddy AI assistant",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:8000",
+      "type": "string"
+    },
+    {
+      "key": "session_id",
+      "value": "test-session-{{$timestamp}}",
+      "type": "string"
+    },
+    {
+      "key": "user_id",
+      "value": "test-user",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "1. Basic Query",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test(\"Status code is 200\", function () {",
+              "    pm.response.to.have.status(200);",
+              "});",
+              "",
+              "pm.test(\"Response has SQL query\", function () {",
+              "    var jsonData = pm.response.json();",
+              "    pm.expect(jsonData.sql).to.be.a('string');",
+              "    pm.expect(jsonData.sql.length).to.be.above(0);",
+              "});",
+              "",
+              "pm.test(\"Response has results\", function () {",
+              "    var jsonData = pm.response.json();",
+              "    pm.expect(jsonData.results).to.be.an('array');",
+              "});",
+              "",
+              "pm.test(\"Response has insights\", function () {",
+              "    var jsonData = pm.response.json();",
+              "    pm.expect(jsonData.insights).to.be.a('string');",
+              "});"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"question\": \"Show me the top 5 customers by total purchase amount\",\n  \"session_id\": \"{{session_id}}\",\n  \"user_id\": \"{{user_id}}\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/rag/query",
+          "host": ["{{base_url}}"],
+          "path": ["rag", "query"]
+        },
+        "description": "Tests basic SQL query generation with RAG and memory"
+      },
+      "response": []
+    },
+    {
+      "name": "2. Follow-up Query (Tests Memory)",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test(\"Status code is 200\", function () {",
+              "    pm.response.to.have.status(200);",
+              "});",
+              "",
+              "pm.test(\"SQL contains context reference\", function () {",
+              "    var jsonData = pm.response.json();",
+              "    pm.expect(jsonData.sql.toLowerCase()).to.include('california');",
+              "});",
+              "",
+              "pm.test(\"Memory context is provided\", function () {",
+              "    var jsonData = pm.response.json();",
+              "    pm.expect(jsonData.memory_context).to.exist;",
+              "});"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"question\": \"Now filter them to California only\",\n  \"session_id\": \"{{session_id}}\",\n  \"user_id\": \"{{user_id}}\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/rag/query",
+          "host": ["{{base_url}}"],
+          "path": ["rag", "query"]
+        },
+        "description": "Tests conversation memory - should understand 'them' refers to previous query"
+      },
+      "response": []
+    },
+    {
+      "name": "3. Get Memory Stats",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test(\"Status code is 200\", function () {",
+              "    pm.response.to.have.status(200);",
+              "});",
+              "",
+              "pm.test(\"Redis stats present\", function () {",
+              "    var jsonData = pm.response.json();",
+              "    pm.expect(jsonData.redis).to.exist;",
+              "    pm.expect(jsonData.redis.recent_exchanges).to.be.above(0);",
+              "});",
+              "",
+              "pm.test(\"Mem0 stats present\", function () {",
+              "    var jsonData = pm.response.json();",
+              "    pm.expect(jsonData.mem0).to.exist;",
+              "    pm.expect(jsonData.mem0.total_memories).to.be.above(0);",
+              "});"
+            ],
+            "type": "text/javascript"
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/rag/memory/stats?session_id={{session_id}}&user_id={{user_id}}",
+          "host": ["{{base_url}}"],
+          "path": ["rag", "memory", "stats"],
+          "query": [
+            {
+              "key": "session_id",
+              "value": "{{session_id}}"
+            },
+            {
+              "key": "user_id",
+              "value": "{{user_id}}"
+            }
+          ]
+        },
+        "description": "Retrieves memory statistics from both Redis and Mem0"
+      },
+      "response": []
+    },
+    {
+      "name": "4. Complex Multi-table Query",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"question\": \"Which product category generated the most revenue last month?\",\n  \"session_id\": \"{{session_id}}\",\n  \"user_id\": \"{{user_id}}\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/rag/query",
+          "host": ["{{base_url}}"],
+          "path": ["rag", "query"]
+        },
+        "description": "Tests RAG retrieval of multiple related tables"
+      },
+      "response": []
+    },
+    {
+      "name": "5. Get All User Memories",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/rag/memory/all/{{user_id}}",
+          "host": ["{{base_url}}"],
+          "path": ["rag", "memory", "all", "{{user_id}}"]
+        },
+        "description": "Retrieves all long-term memories for a user"
+      },
+      "response": []
+    },
+    {
+      "name": "6. Clear Redis Session Memory",
+      "request": {
+        "method": "DELETE",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/rag/memory/redis/{{session_id}}",
+          "host": ["{{base_url}}"],
+          "path": ["rag", "memory", "redis", "{{session_id}}"]
+        },
+        "description": "Clears short-term Redis memory for the session"
+      },
+      "response": []
+    },
+    {
+      "name": "7. Clear Mem0 User Memory",
+      "request": {
+        "method": "DELETE",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/rag/memory/mem0/{{user_id}}",
+          "host": ["{{base_url

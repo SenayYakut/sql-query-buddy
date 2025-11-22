@@ -1,0 +1,292 @@
+"""
+SQL Query Buddy with Hybrid Memory System (Redis + Mem0).
+"""
+from fastapi import APIRouter
+from pydantic import BaseModel
+import sqlite3
+import os
+import time
+from typing import List, Dict, Optional
+from dotenv import load_dotenv
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_chroma import Chroma
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough
+
+# Import Hybrid Memory Manager (Redis + Mem0)
+from .redis_mem0_memory import HybridMemoryManager
+
+load_dotenv()
+
+DB_PATH = "backend/db/retail.db"
+VECTOR_DIR = "backend/rag/vectorstore"
+router = APIRouter()
+
+# Initialize components
+llm = ChatOpenAI(model_name="gpt-4", temperature=0)
+embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
+vectorstore = Chroma(
+    collection_name="schema_embeddings",
+    embedding_function=embeddings,
+    persist_directory=VECTOR_DIR
+)
+
+# Initialize Hybrid Memory Manager (Redis + Mem0)
+try:
+    hybrid_memory = HybridMemoryManager()
+except Exception as e:
+    print(f"Warning: Memory system not available - {e}")
+    hybrid_memory = None
+
+# Request/Response models
+class QueryRequest(BaseModel):
+    question: str
+    session_id: Optional[str] = "default"
+    user_id: Optional[str] = "anonymous"
+
+class QueryResponse(BaseModel):
+    sql: str
+    results: List[Dict]
+    insights: str
+    explanation: str
+    optimization: str
+    execution_time_ms: float
+    memory_context: Optional[Dict[str, str]] = {}
+
+# Helper functions
+def format_docs(docs):
+    return "\n\n".join([
+        f"Table: {doc.metadata.get('table', 'Unknown')}\n{doc.page_content}" 
+        for doc in docs
+    ])
+
+def run_sql(query: str) -> tuple[List[Dict], float]:
+    try:
+        start_time = time.time()
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(query)
+        columns = [desc[0] for desc in cursor.description] if cursor.description else []
+        rows = cursor.fetchall()
+        conn.close()
+        execution_time = (time.time() - start_time) * 1000
+        return [dict(zip(columns, row)) for row in rows], execution_time
+    except Exception as e:
+        return [{"error": str(e)}], 0.0
+
+# SQL Generation with Hybrid Memory (Redis + Mem0)
+def generate_sql_with_hybrid_memory(
+    question: str,
+    session_id: str,
+    user_id: str
+) -> tuple[str, Dict[str, str]]:
+    """Generate SQL using RAG + Hybrid Memory (Redis short-term + Mem0 long-term)."""
+    
+    # Get combined context from both Redis and Mem0
+    memory_contexts = {}
+    if hybrid_memory:
+        memory_contexts = hybrid_memory.get_combined_context(
+            question=question,
+            session_id=session_id,
+            user_id=user_id
+        )
+    
+    combined_context = memory_contexts.get("combined", "")
+    
+    # Get schema context via RAG
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+    
+    # Enhanced prompt
+    template = """You are a SQL expert for a SQLite retail database.
+
+DATABASE SCHEMA (Retrieved via RAG):
+{schema_context}
+
+MEMORY CONTEXT:
+{memory_context}
+
+USER QUESTION: {question}
+
+IMPORTANT:
+- Consider ALL context (recent Redis conversation + past Mem0 memories)
+- Understand follow-up references like "them", "those", "previous results"
+- Generate ONLY the SQL query without explanations
+- Use SQLite syntax
+
+SQL Query:"""
+
+    prompt = ChatPromptTemplate.from_template(template)
+    
+    rag_chain = (
+        {
+            "schema_context": retriever | format_docs,
+            "memory_context": lambda _: combined_context if combined_context else "No relevant context.",
+            "question": RunnablePassthrough()
+        }
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
+    
+    sql_query = rag_chain.invoke(question).strip()
+    
+    # Clean SQL
+    for prefix in ["```sql", "```"]:
+        if sql_query.startswith(prefix):
+            sql_query = sql_query[len(prefix):]
+    if sql_query.endswith("```"):
+        sql_query = sql_query[:-3]
+    
+    return sql_query.strip(), memory_contexts
+
+# Analysis functions
+def explain_sql(sql_query: str, question: str) -> str:
+    try:
+        prompt = f"""Explain this SQL in simple terms.
+SQL: {sql_query}
+Question: {question}
+2-3 sentences for beginners."""
+        return llm.invoke(prompt).content
+    except:
+        return "Unable to explain."
+
+def suggest_optimizations(sql_query: str, execution_time: float, result_count: int) -> str:
+    try:
+        prompt = f"""Suggest optimizations.
+SQL: {sql_query}
+Time: {execution_time:.2f}ms
+Rows: {result_count}
+2-3 tips."""
+        return llm.invoke(prompt).content
+    except:
+        return "Query is already optimized."
+
+def generate_insights(results: List[Dict], question: str, sql_query: str) -> str:
+    try:
+        if not results:
+            return "No results found."
+        if "error" in results[0]:
+            return f"Error: {results[0]['error']}"
+        
+        sample = results[:10]
+        prompt = f"""Analyze these results.
+Question: {question}
+Results ({len(results)} rows): {sample}
+Provide key insights."""
+        return llm.invoke(prompt).content
+    except:
+        return "Unable to generate insights."
+
+# Main endpoint with Hybrid Memory
+@router.post("/query", response_model=QueryResponse)
+def query_rag(req: QueryRequest):
+    """
+    Enhanced endpoint with Hybrid Memory System (Redis + Mem0).
+    """
+    try:
+        session_id = req.session_id or "default"
+        user_id = req.user_id or "anonymous"
+        
+        # 1. Generate SQL with Hybrid Memory context
+        sql_query, memory_contexts = generate_sql_with_hybrid_memory(
+            req.question, session_id, user_id
+        )
+        
+        # 2. Execute SQL
+        results, execution_time = run_sql(sql_query)
+        
+        # 3. Check for errors
+        has_error = False
+        if results and "error" in results[0]:
+            has_error = True
+        
+        if has_error:
+            return QueryResponse(
+                sql=sql_query,
+                results=results,
+                insights=f"Query failed: {results[0]['error']}",
+                explanation="SQL execution error.",
+                optimization="Fix syntax first.",
+                execution_time_ms=execution_time,
+                memory_context=memory_contexts
+            )
+        
+        # 4. Generate analysis
+        explanation = explain_sql(sql_query, req.question)
+        optimization = suggest_optimizations(sql_query, execution_time, len(results))
+        insights = generate_insights(results, req.question, sql_query)
+        
+        # 5. Store in BOTH Redis (short-term) AND Mem0 (long-term)
+        if hybrid_memory:
+            try:
+                hybrid_memory.store_interaction(
+                    question=req.question,
+                    sql=sql_query,
+                    results=results,
+                    insights=insights,
+                    user_id=user_id,
+                    session_id=session_id
+                )
+            except Exception as mem_error:
+                print(f"Warning: Error storing memory: {mem_error}")
+        
+        return QueryResponse(
+            sql=sql_query,
+            results=results,
+            insights=insights,
+            explanation=explanation,
+            optimization=optimization,
+            execution_time_ms=execution_time,
+            memory_context=memory_contexts
+        )
+        
+    except Exception as e:
+        import traceback
+        print(f"Error: {e}")
+        print(traceback.format_exc())
+        
+        return QueryResponse(
+            sql="Error",
+            results=[{"error": str(e)}],
+            insights="Error occurred.",
+            explanation=str(e),
+            optimization="N/A",
+            execution_time_ms=0.0,
+            memory_context={}
+        )
+
+# Memory management endpoints
+@router.get("/memory/stats")
+def get_memory_stats(session_id: str = "default", user_id: str = "anonymous"):
+    """Get memory statistics from both Redis and Mem0."""
+    if not hybrid_memory:
+        return {"error": "Memory system not available"}
+    return hybrid_memory.get_memory_stats(session_id, user_id)
+
+@router.delete("/memory/redis/{session_id}")
+def clear_redis_memory(session_id: str):
+    """Clear Redis short-term memory for a session."""
+    if not hybrid_memory:
+        return {"error": "Memory system not available"}
+    return hybrid_memory.clear_short_term(session_id)
+
+@router.delete("/memory/mem0/{user_id}")
+def clear_mem0_memory(user_id: str):
+    """Clear Mem0 long-term memory for a user."""
+    if not hybrid_memory:
+        return {"error": "Memory system not available"}
+    return hybrid_memory.delete_all_memories(user_id)
+
+@router.get("/memory/all/{user_id}")
+def get_all_memories(user_id: str):
+    """Get all long-term memories for a user."""
+    if not hybrid_memory:
+        return {"error": "Memory system not available"}
+    
+    memories = hybrid_memory.get_all_memories(user_id)
+    return {
+        "user_id": user_id,
+        "memories": memories,
+        "count": len(memories) if memories else 0
+    }
