@@ -44,6 +44,7 @@ class QueryRequest(BaseModel):
     question: str
     session_id: Optional[str] = "default"
     user_id: Optional[str] = "anonymous"
+    api_key: Optional[str] = None  # Allow users to provide their own OpenAI API key
 
 class QueryResponse(BaseModel):
     sql: str
@@ -79,10 +80,17 @@ def run_sql(query: str) -> tuple[List[Dict], float]:
 def generate_sql_with_hybrid_memory(
     question: str,
     session_id: str,
-    user_id: str
+    user_id: str,
+    api_key: Optional[str] = None
 ) -> tuple[str, Dict[str, str]]:
     """Generate SQL using RAG + Hybrid Memory (Redis short-term + Mem0 long-term)."""
-    
+
+    # Create LLM instance with provided API key or use default
+    if api_key:
+        query_llm = ChatOpenAI(model_name="gpt-4", temperature=0, openai_api_key=api_key)
+    else:
+        query_llm = llm  # Use global instance
+
     # Get combined context from both Redis and Mem0
     memory_contexts = {}
     if hybrid_memory:
@@ -91,9 +99,9 @@ def generate_sql_with_hybrid_memory(
             session_id=session_id,
             user_id=user_id
         )
-    
+
     combined_context = memory_contexts.get("combined", "")
-    
+
     # Get schema context via RAG
     retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
     
@@ -125,7 +133,7 @@ SQL Query:"""
             "question": RunnablePassthrough()
         }
         | prompt
-        | llm
+        | query_llm
         | StrOutputParser()
     )
     
@@ -141,40 +149,43 @@ SQL Query:"""
     return sql_query.strip(), memory_contexts
 
 # Analysis functions
-def explain_sql(sql_query: str, question: str) -> str:
+def explain_sql(sql_query: str, question: str, api_key: Optional[str] = None) -> str:
     try:
+        analysis_llm = ChatOpenAI(model_name="gpt-4", temperature=0, openai_api_key=api_key) if api_key else llm
         prompt = f"""Explain this SQL in simple terms.
 SQL: {sql_query}
 Question: {question}
 2-3 sentences for beginners."""
-        return llm.invoke(prompt).content
+        return analysis_llm.invoke(prompt).content
     except:
         return "Unable to explain."
 
-def suggest_optimizations(sql_query: str, execution_time: float, result_count: int) -> str:
+def suggest_optimizations(sql_query: str, execution_time: float, result_count: int, api_key: Optional[str] = None) -> str:
     try:
+        analysis_llm = ChatOpenAI(model_name="gpt-4", temperature=0, openai_api_key=api_key) if api_key else llm
         prompt = f"""Suggest optimizations.
 SQL: {sql_query}
 Time: {execution_time:.2f}ms
 Rows: {result_count}
 2-3 tips."""
-        return llm.invoke(prompt).content
+        return analysis_llm.invoke(prompt).content
     except:
         return "Query is already optimized."
 
-def generate_insights(results: List[Dict], question: str, sql_query: str) -> str:
+def generate_insights(results: List[Dict], question: str, sql_query: str, api_key: Optional[str] = None) -> str:
     try:
         if not results:
             return "No results found."
         if "error" in results[0]:
             return f"Error: {results[0]['error']}"
-        
+
+        analysis_llm = ChatOpenAI(model_name="gpt-4", temperature=0, openai_api_key=api_key) if api_key else llm
         sample = results[:10]
         prompt = f"""Analyze these results.
 Question: {question}
 Results ({len(results)} rows): {sample}
 Provide key insights."""
-        return llm.invoke(prompt).content
+        return analysis_llm.invoke(prompt).content
     except:
         return "Unable to generate insights."
 
@@ -187,20 +198,21 @@ def query_rag(req: QueryRequest):
     try:
         session_id = req.session_id or "default"
         user_id = req.user_id or "anonymous"
-        
+        api_key = req.api_key  # Get API key from request
+
         # 1. Generate SQL with Hybrid Memory context
         sql_query, memory_contexts = generate_sql_with_hybrid_memory(
-            req.question, session_id, user_id
+            req.question, session_id, user_id, api_key
         )
-        
+
         # 2. Execute SQL
         results, execution_time = run_sql(sql_query)
-        
+
         # 3. Check for errors
         has_error = False
         if results and "error" in results[0]:
             has_error = True
-        
+
         if has_error:
             return QueryResponse(
                 sql=sql_query,
@@ -211,11 +223,11 @@ def query_rag(req: QueryRequest):
                 execution_time_ms=execution_time,
                 memory_context=memory_contexts
             )
-        
+
         # 4. Generate analysis
-        explanation = explain_sql(sql_query, req.question)
-        optimization = suggest_optimizations(sql_query, execution_time, len(results))
-        insights = generate_insights(results, req.question, sql_query)
+        explanation = explain_sql(sql_query, req.question, api_key)
+        optimization = suggest_optimizations(sql_query, execution_time, len(results), api_key)
+        insights = generate_insights(results, req.question, sql_query, api_key)
         
         # 5. Store in BOTH Redis (short-term) AND Mem0 (long-term)
         if hybrid_memory:
